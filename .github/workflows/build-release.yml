@@ -1,0 +1,84 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create a GitHub release"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Release tag to create, for example v1.0.0"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      PROJECT_PATH: ${{ github.workspace }}\RagProxyCompat\RagProxyCompat.csproj
+      PUBLISH_DIR: ${{ github.workspace }}\artifacts\publish\win-x64
+      ZIP_PATH: ${{ github.workspace }}\artifacts\GTA-IV-RAG-MITM-Proxy-win-x64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Restore
+        run: dotnet restore $env:PROJECT_PATH
+
+      - name: Build
+        run: dotnet build $env:PROJECT_PATH -c Release --no-restore
+
+      - name: Self-test
+        run: dotnet run --project $env:PROJECT_PATH -- --self-test
+
+      - name: Publish win-x64
+        run: >
+          dotnet publish $env:PROJECT_PATH
+          -c Release
+          -r win-x64
+          --self-contained true
+          /p:PublishSingleFile=true
+          /p:DebugType=None
+          /p:DebugSymbols=false
+          -o $env:PUBLISH_DIR
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          if (Test-Path $env:ZIP_PATH) {
+            Remove-Item $env:ZIP_PATH -Force
+          }
+          $publishFiles = Join-Path $env:PUBLISH_DIR '*'
+          Compress-Archive -Path $publishFiles -DestinationPath $env:ZIP_PATH
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTA-IV-RAG-MITM-Proxy-win-x64
+          path: ${{ env.ZIP_PATH }}
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release && inputs.release_tag != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+          files: ${{ env.ZIP_PATH }}
+          generate_release_notes: true

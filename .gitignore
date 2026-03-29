@@ -1,0 +1,31 @@
+# Build outputs
+bin/
+obj/
+artifacts/
+
+# IDE / tooling
+.vs/
+*.user
+*.suo
+*.userprefs
+
+# Logs / traces
+*.log
+*.ulog
+rag-trace.log
+
+# Published / packaged outputs
+*.zip
+
+# Local binaries and symbols
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+
+# Local XEX scratch / patch artifacts
+*.base
+*.xex
+
+# OS cruft
+Thumbs.db
+Desktop.ini
