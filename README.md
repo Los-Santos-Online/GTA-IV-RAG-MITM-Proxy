@@ -48,9 +48,9 @@ Typical local setup:
 ```powershell
 dotnet run --project X:\Repositories\RagProxy\RagProxyCompat\RagProxyCompat.csproj -- `
   --listen-address 0.0.0.0 `
-  --listen-port 2000 `
+  --listen-port 2001 `
   --target-address 127.0.0.1 `
-  --target-port 2001 `
+  --target-port 2000 `
   --proxy-base-port 61000 `
   --verbose `
   --dump-file X:\Repositories\RagProxy\rag-trace.log
