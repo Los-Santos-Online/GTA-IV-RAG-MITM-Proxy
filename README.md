@@ -82,13 +82,6 @@ If the game is hard-coded to `2000`, the simplest setup is:
 
 If you need to change the game’s RAG port, patch the hard-coded port value in the game binary or launcher configuration to match the proxy.
 
-### Known GTA IV bootstrap port patch
-
-Using the local decrypted XEXs in this repo:
-
-- [gta4bankrelease_xenon.unpacked.xex](/X:/Repositories/RagProxy/gta4bankrelease_xenon.unpacked.xex)
-- [gta4bankrelease_xenon.port2001.xex](/X:/Repositories/RagProxy/gta4bankrelease_xenon.port2001.xex)
-
 there is exactly one byte difference for the port patch:
 
 - file offset: `0x31F8B7`
