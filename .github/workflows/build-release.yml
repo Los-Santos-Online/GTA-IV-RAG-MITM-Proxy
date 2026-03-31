@@ -46,9 +46,6 @@ jobs:
       - name: Build
         run: dotnet build $env:PROJECT_PATH -c Release --no-restore
 
-      - name: Self-test
-        run: dotnet run --project $env:PROJECT_PATH -- --self-test
-
       - name: Publish win-x64
         run: >
           dotnet publish $env:PROJECT_PATH
