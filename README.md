@@ -40,9 +40,9 @@ Typical local setup:
 ```powershell
 dotnet run --project X:\Repositories\RagProxy\RagProxyCompat\RagProxyCompat.csproj -- `
   --listen-address 0.0.0.0 `
-  --listen-port 2000 `
+  --listen-port 2001 `
   --target-address 127.0.0.1 `
-  --target-port 2001 `
+  --target-port 2000 `
   --proxy-base-port 61000 `
   --verbose
 ```
@@ -70,13 +70,6 @@ If the game is hard-coded to `2000`, the simplest setup is:
 - point the game at the proxy host IP
 
 If you need to change the game’s RAG port, patch the hard-coded port value in the game binary or launcher configuration to match the proxy.
-
-### Known GTA IV bootstrap port patch
-
-Using the local decrypted XEXs in this repo:
-
-- [gta4bankrelease_xenon.unpacked.xex](/X:/Repositories/RagProxy/gta4bankrelease_xenon.unpacked.xex)
-- [gta4bankrelease_xenon.port2001.xex](/X:/Repositories/RagProxy/gta4bankrelease_xenon.port2001.xex)
 
 there is exactly one byte difference for the port patch:
 
