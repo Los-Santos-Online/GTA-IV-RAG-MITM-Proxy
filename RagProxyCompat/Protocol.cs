@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
-using System.Text;
 
 namespace RagProxyCompat;
 
@@ -201,29 +200,6 @@ internal sealed class RagPacket
     }
 
     public override string ToString() => $"{PacketType} len={Payload.Length} guid=0x{Guid:X8} id={Id}";
-
-    public string Describe(RagPacketFormat format)
-    {
-        int headerSize = GetHeaderSize(format);
-        return $"format={format} total={headerSize + Payload.Length} cmd={(ushort)PacketType}({PacketType}) guid=0x{Guid:X8} id={Id} payload={Payload.Length}";
-    }
-
-    public string ToHex(RagPacketFormat format)
-    {
-        byte[] data = ToByteArray(format);
-        StringBuilder builder = new(data.Length * 3);
-        for (int i = 0; i < data.Length; i++)
-        {
-            if (i > 0)
-            {
-                builder.Append(' ');
-            }
-
-            builder.AppendFormat("{0:X2}", data[i]);
-        }
-
-        return builder.ToString();
-    }
 
     private RagPacket CloneWithPayload(byte[] payload)
     {

@@ -9,7 +9,7 @@ Small compatibility bridge for older RAGE bank handshakes against the GTA V-era 
 - Rewrites the incoming legacy handshake version to the modern v2 handshake expected by the newer RAG stack.
 - Rewrites the reply back down to the legacy format expected by the old game.
 - Rewrites the returned base port to a local proxy triplet and relays the later `bank`, `output`, and `events` sockets through the compatibility layer as well.
-- Normalizes legacy `bank` ingress into complete `RemotePacket` records and re-wraps them as `CHN:` blocks for the modern RAG bank parser.
+- Normalizes legacy `bank` ingress into complete `RemotePacket` records and re-wraps them as one `CHN:` frame per packet for the modern RAG bank parser.
 - Relays `output`, `events`, and `bank` egress as raw byte streams instead of trying to reinterpret them as bootstrap packets.
 - For GTA IV specifically, a zero-length bootstrap request is treated as a legacy handshake that still expects a `1.92` version in the reply.
 
@@ -18,7 +18,7 @@ Small compatibility bridge for older RAGE bank handshakes against the GTA V-era 
 - This build now proxies both the bootstrap socket and the later `bank`, `output`, and `events` sockets.
 - The default local relay range starts at `61000`, and the proxy reserves the first free consecutive triplet from there.
 - Only the bootstrap socket gets legacy-handshake translation.
-- `output`, `events`, and `bank` egress are forwarded byte-for-byte with chunk logging.
+- `output`, `events`, and `bank` egress are forwarded byte-for-byte.
 - `bank` ingress is stateful: compressed chunks are decompressed, partial `RemotePacket` tails are buffered, and only complete packets are re-emitted toward RAG.
 
 ## Current protocol assumption
@@ -46,8 +46,7 @@ dotnet run --project X:\Repositories\RagProxy\RagProxyCompat -- `
   --target-address 127.0.0.1 `
   --target-port 2001 `
   --proxy-base-port 61000 `
-  --verbose `
-  --dump-file X:\Repositories\RagProxy\rag-trace.log
+  --verbose
 ```
 
 Example topology:
@@ -56,29 +55,6 @@ Example topology:
 2. Point this proxy at the modern RAG listener with `--target-address` and `--target-port`.
 
 If the real modern RAG endpoint is fixed to `2000`, run it on a different IP or place this proxy in front of it with port forwarding.
-
-## Self-check
-
-```powershell
-dotnet run --project X:\Repositories\RagProxy\RagProxyCompat -- --self-test
-```
-
-## Packet tracing
-
-Use `--dump-file` to capture every proxied packet with decoded header fields and raw hex:
-
-```powershell
-dotnet run --project X:\Repositories\RagProxy\RagProxyCompat -- `
-  --listen-address 0.0.0.0 `
-  --listen-port 2001 `
-  --target-address 127.0.0.1 `
-  --target-port 2000 `
-  --proxy-base-port 61000 `
-  --verbose `
-  --dump-file X:\Repositories\RagProxy\rag-trace.log
-```
-
-That trace file now includes the translated bootstrap exchange plus raw chunk dumps for the later `bank`, `output`, and `events` channels, including the normalized `bank` ingress writes toward RAG.
 
 ## Likely next step
 

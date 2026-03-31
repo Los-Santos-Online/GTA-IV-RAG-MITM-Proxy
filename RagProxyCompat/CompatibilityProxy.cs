@@ -12,22 +12,12 @@ internal sealed class CompatibilityProxy : IDisposable
 
     private readonly ProxyOptions _options;
     private readonly TcpListener _listener;
-    private readonly StreamWriter? _traceWriter;
     private readonly object _logLock = new();
 
     public CompatibilityProxy(ProxyOptions options)
     {
         _options = options;
         _listener = new TcpListener(options.ListenAddress, options.ListenPort);
-        if (!string.IsNullOrWhiteSpace(options.DumpFilePath))
-        {
-            string fullPath = Path.GetFullPath(options.DumpFilePath);
-            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-            _traceWriter = new StreamWriter(new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.Read))
-            {
-                AutoFlush = true,
-            };
-        }
     }
 
     public async Task RunAsync()
@@ -39,66 +29,86 @@ internal sealed class CompatibilityProxy : IDisposable
             cts.Cancel();
         };
 
+        Task? viewerTask = null;
+        if (_options.ViewerEnabled)
+        {
+            if (RangesOverlap(
+                _options.ProxyBasePortStart,
+                _options.ProxyBasePortStart + ChannelNames.Length - 1,
+                _options.ViewerProxyBasePort,
+                _options.ViewerProxyBasePort + ChannelNames.Length - 1))
+            {
+                Log($"Warning: viewer proxy base port {_options.ViewerProxyBasePort} overlaps handshake proxy base {_options.ProxyBasePortStart}. Use --viewer-proxy-base-port to avoid collisions.");
+            }
+
+            viewerTask = Task.Run(() => RunViewerRelayAsync(cts.Token), cts.Token);
+        }
+
         _listener.Start();
         Log($"Listening on {_options.ListenAddress}:{_options.ListenPort}, forwarding to {_options.TargetAddress}:{_options.TargetPort}");
-        if (_traceWriter is not null)
-        {
-            Log($"Packet dump file: {Path.GetFullPath(_options.DumpFilePath!)}");
-        }
 
         while (!cts.Token.IsCancellationRequested)
         {
             TcpClient upstream = await _listener.AcceptTcpClientAsync(cts.Token);
             _ = Task.Run(() => HandleConnectionAsync(upstream, cts.Token), cts.Token);
         }
+
+        if (viewerTask is not null)
+        {
+            await viewerTask;
+        }
     }
 
     public void Dispose()
     {
         _listener.Stop();
-        _traceWriter?.Dispose();
     }
 
     private async Task HandleConnectionAsync(TcpClient upstreamClient, CancellationToken cancellationToken)
     {
         using TcpClient upstream = upstreamClient;
         using TcpClient downstream = new();
+        using CancellationTokenSource connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         try
         {
             Log($"Upstream connected from {upstream.Client.RemoteEndPoint}");
 
-            await downstream.ConnectAsync(_options.TargetAddress, _options.TargetPort, cancellationToken);
+            await downstream.ConnectAsync(_options.TargetAddress, _options.TargetPort, connectionCts.Token);
             Log($"Downstream connected to {_options.TargetAddress}:{_options.TargetPort}");
 
             using NetworkStream upstreamStream = upstream.GetStream();
             using NetworkStream downstreamStream = downstream.GetStream();
 
-            HandshakeBridgeResult handshake = await BridgeHandshakeAsync(upstreamStream, downstreamStream, cancellationToken);
+            HandshakeBridgeResult handshake = await BridgeHandshakeAsync(upstreamStream, downstreamStream, connectionCts.Token);
             Log($"Negotiated compatibility mode: {handshake.Translation}");
 
-            Task upstreamToDownstream = PumpAsync(
-                source: upstreamStream,
-                destination: downstreamStream,
-                directionName: "bootstrap game->rag",
-                sourceFormat: RagPacketFormat.Legacy8,
-                destinationFormat: RagPacketFormat.Modern12,
-                transform: static (packet, _) => RewriteBootstrapGamePacket(packet),
-                handshake.Translation.Protocol,
-                cancellationToken);
+            using (handshake.ChannelSession)
+            {
+                Task upstreamToDownstream = PumpAsync(
+                    source: upstreamStream,
+                    destination: downstreamStream,
+                    directionName: "bootstrap game->rag",
+                    sourceFormat: RagPacketFormat.Legacy8,
+                    destinationFormat: RagPacketFormat.Modern12,
+                    transform: static (packet, _) => RewriteBootstrapGamePacket(packet),
+                    handshake.Translation.Protocol,
+                    connectionCts.Token);
 
-            Task downstreamToUpstream = PumpAsync(
-                source: downstreamStream,
-                destination: upstreamStream,
-                directionName: "bootstrap rag->game",
-                sourceFormat: RagPacketFormat.Modern12,
-                destinationFormat: RagPacketFormat.Legacy8,
-                transform: static (packet, _) => packet,
-                handshake.Translation.Protocol,
-                cancellationToken);
+                Task downstreamToUpstream = PumpAsync(
+                    source: downstreamStream,
+                    destination: upstreamStream,
+                    directionName: "bootstrap rag->game",
+                    sourceFormat: RagPacketFormat.Modern12,
+                    destinationFormat: RagPacketFormat.Legacy8,
+                    transform: static (packet, _) => packet,
+                    handshake.Translation.Protocol,
+                    connectionCts.Token);
 
-            Task bootstrapCompletion = Task.WhenAny(upstreamToDownstream, downstreamToUpstream);
-            await Task.WhenAll(bootstrapCompletion, handshake.ChannelSession.Completion);
+                await handshake.ChannelSession.Completion;
+                connectionCts.Cancel();
+                await Task.WhenAll(upstreamToDownstream, downstreamToUpstream);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -127,13 +137,11 @@ internal sealed class CompatibilityProxy : IDisposable
 
         HandshakeTranslation translation = DetectHandshakeTranslation(gameHandshake);
         Log($"Upstream handshake packet: {gameHandshake}");
-        TracePacket("game->proxy received", RagPacketFormat.Legacy8, gameHandshake);
 
         RagPacket forwardedHandshake = translation.RequiresRewrite
             ? gameHandshake.RewriteHandshakeVersion(RagPacket.ModernVersion)
             : gameHandshake;
 
-        TracePacket("proxy->rag send", RagPacketFormat.Modern12, forwardedHandshake);
         await forwardedHandshake.WriteAsync(downstream, RagPacketFormat.Modern12, cancellationToken);
         Log($"Forwarded handshake to downstream as {DescribeHandshake(forwardedHandshake)}");
 
@@ -149,7 +157,6 @@ internal sealed class CompatibilityProxy : IDisposable
         }
 
         Log($"Downstream handshake reply: {ragReply}");
-        TracePacket("rag->proxy received", RagPacketFormat.Modern12, ragReply);
 
         int downstreamBasePort = ragReply.ReadInt32();
         ChannelProxySession channelSession = CreateChannelSession(downstreamBasePort, translation.Protocol, cancellationToken);
@@ -159,7 +166,6 @@ internal sealed class CompatibilityProxy : IDisposable
             translation.RequiresRewrite ? translation.LegacyReplyVersion : ExtractReplyVersion(ragReply),
             basePortOverride: channelSession.ProxyBasePort);
 
-        TracePacket("proxy->game send", RagPacketFormat.Legacy8, replyToGame);
         await replyToGame.WriteAsync(upstream, RagPacketFormat.Legacy8, cancellationToken);
         Log($"Forwarded handshake reply upstream as {DescribeHandshake(replyToGame)}");
 
@@ -186,6 +192,7 @@ internal sealed class CompatibilityProxy : IDisposable
                     proxyBasePort: candidate,
                     downstreamBasePort: downstreamBasePort,
                     protocol: protocol,
+                    downstreamConnectTimeout: TimeSpan.FromSeconds(5),
                     cancellationToken: cancellationToken);
             }
             catch (SocketException)
@@ -198,6 +205,53 @@ internal sealed class CompatibilityProxy : IDisposable
         }
 
         throw new InvalidOperationException($"Failed to reserve three consecutive proxy ports starting at {_options.ProxyBasePortStart}.");
+    }
+
+    private async Task RunViewerRelayAsync(CancellationToken cancellationToken)
+    {
+        int proxyBasePort = _options.ViewerProxyBasePort;
+        int downstreamBasePort = _options.ViewerTargetBasePort;
+
+        Log($"Viewer relay enabled: {_options.ListenAddress}:{proxyBasePort}-{proxyBasePort + ChannelNames.Length - 1} -> {_options.TargetAddress}:{downstreamBasePort}-{downstreamBasePort + ChannelNames.Length - 1}");
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            TcpListener[] listeners = new TcpListener[ChannelNames.Length];
+            try
+            {
+                for (int i = 0; i < ChannelNames.Length; i++)
+                {
+                    TcpListener listener = new(_options.ListenAddress, proxyBasePort + i);
+                    listener.Start();
+                    listeners[i] = listener;
+                }
+
+                using ChannelProxySession session = new(
+                    proxy: this,
+                    listeners: listeners,
+                    proxyBasePort: proxyBasePort,
+                    downstreamBasePort: downstreamBasePort,
+                    protocol: RagProtocolVersion.LegacyVersioned,
+                    downstreamConnectTimeout: TimeSpan.FromSeconds(30),
+                    cancellationToken: cancellationToken);
+
+                await session.Completion;
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (SocketException ex)
+            {
+                foreach (TcpListener? listener in listeners)
+                {
+                    listener?.Stop();
+                }
+
+                Log($"Viewer relay failed to bind to {proxyBasePort}-{proxyBasePort + ChannelNames.Length - 1}: {ex.Message}");
+                await Task.Delay(1000, cancellationToken);
+            }
+        }
     }
 
     private async Task PumpAsync(
@@ -218,14 +272,12 @@ internal sealed class CompatibilityProxy : IDisposable
                 break;
             }
 
-            TracePacket($"{directionName} received", sourceFormat, packet);
             RagPacket forwarded = transform(packet, protocol);
             if (_options.Verbose)
             {
                 Log($"{directionName}: {forwarded}");
             }
 
-            TracePacket($"{directionName} forwarded", destinationFormat, forwarded);
             await forwarded.WriteAsync(destination, destinationFormat, cancellationToken);
         }
     }
@@ -267,10 +319,8 @@ internal sealed class CompatibilityProxy : IDisposable
                 break;
             }
 
-            TraceRawChunk($"{directionName} received", buffer.AsSpan(0, bytesRead));
             await destination.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
             await destination.FlushAsync(cancellationToken);
-            TraceRawChunk($"{directionName} forwarded", buffer.AsSpan(0, bytesRead));
         }
     }
 
@@ -281,7 +331,7 @@ internal sealed class CompatibilityProxy : IDisposable
         CancellationToken cancellationToken)
     {
         byte[] buffer = new byte[64 * 1024];
-        BankIngressNormalizer normalizer = new();
+        BankIngressNormalizer normalizer = new(Log);
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -292,13 +342,15 @@ internal sealed class CompatibilityProxy : IDisposable
             }
 
             ReadOnlySpan<byte> chunk = buffer.AsSpan(0, bytesRead);
-            TraceRawChunk($"{directionName} received", chunk);
 
             IReadOnlyList<byte[]> forwarded = normalizer.ProcessChunk(chunk);
             foreach (byte[] output in forwarded)
             {
                 await destination.WriteAsync(output, cancellationToken);
-                TraceRawChunk($"{directionName} forwarded", output);
+                if (_options.Verbose)
+                {
+                    Log($"{directionName} packet len={output.Length}");
+                }
             }
 
             if (forwarded.Count > 0)
@@ -315,7 +367,7 @@ internal sealed class CompatibilityProxy : IDisposable
         CancellationToken cancellationToken)
     {
         byte[] buffer = new byte[64 * 1024];
-        BankEgressNormalizer normalizer = new();
+        BankEgressNormalizer normalizer = new(Log);
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -326,13 +378,15 @@ internal sealed class CompatibilityProxy : IDisposable
             }
 
             ReadOnlySpan<byte> chunk = buffer.AsSpan(0, bytesRead);
-            TraceRawChunk($"{directionName} received", chunk);
 
             IReadOnlyList<byte[]> forwarded = normalizer.ProcessChunk(chunk);
             foreach (byte[] output in forwarded)
             {
                 await destination.WriteAsync(output, cancellationToken);
-                TraceRawChunk($"{directionName} forwarded", output);
+                if (_options.Verbose)
+                {
+                    Log($"{directionName} packet len={output.Length}");
+                }
             }
 
             if (forwarded.Count > 0)
@@ -435,72 +489,51 @@ internal sealed class CompatibilityProxy : IDisposable
         return payload;
     }
 
+    private static bool RangesOverlap(int startA, int endA, int startB, int endB)
+        => startA <= endB && startB <= endA;
+
+    private async Task<TcpClient?> ConnectWithRetryAsync(
+        IPAddress address,
+        int port,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        DateTime start = DateTime.UtcNow;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            TcpClient client = new();
+            try
+            {
+                await client.ConnectAsync(address, port, cancellationToken);
+                return client;
+            }
+            catch (OperationCanceledException)
+            {
+                client.Dispose();
+                throw;
+            }
+            catch (SocketException)
+            {
+                client.Dispose();
+            }
+
+            if (timeout != Timeout.InfiniteTimeSpan && DateTime.UtcNow - start >= timeout)
+            {
+                break;
+            }
+
+            await Task.Delay(200, cancellationToken);
+        }
+
+        return null;
+    }
+
     private void Log(string message)
-    {
-        WriteTrace(message, writeToConsole: true);
-    }
-
-    private void TracePacket(string stage, RagPacketFormat format, RagPacket packet)
-    {
-        if (!_options.Verbose && _traceWriter is null)
-        {
-            return;
-        }
-
-        string message = $"{stage}: {packet.Describe(format)} hex=[{packet.ToHex(format)}]";
-        WriteTrace(message, writeToConsole: _options.Verbose);
-    }
-
-    private void TraceRawChunk(string stage, ReadOnlySpan<byte> bytes)
-    {
-        if (!_options.Verbose && _traceWriter is null)
-        {
-            return;
-        }
-
-        WriteTrace($"{stage}: len={bytes.Length} hex=[{FormatHex(bytes)}]", writeToConsole: _options.Verbose);
-        if (stage.StartsWith("bank ", StringComparison.Ordinal))
-        {
-            foreach (string line in BankTraceDecoder.DescribeChunk(bytes))
-            {
-                WriteTrace($"{stage} meta: {line}", writeToConsole: _options.Verbose);
-            }
-        }
-    }
-
-    private static string FormatHex(ReadOnlySpan<byte> bytes)
-    {
-        string hex = Convert.ToHexString(bytes.ToArray());
-        if (hex.Length == 0)
-        {
-            return string.Empty;
-        }
-
-        StringBuilder spaced = new(hex.Length + (hex.Length / 2));
-        for (int i = 0; i < hex.Length; i += 2)
-        {
-            if (i > 0)
-            {
-                spaced.Append(' ');
-            }
-
-            spaced.Append(hex, i, 2);
-        }
-
-        return spaced.ToString();
-    }
-
-    private void WriteTrace(string message, bool writeToConsole)
     {
         string line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
         lock (_logLock)
         {
-            if (writeToConsole)
-            {
-                Console.WriteLine(line);
-            }
-
-            _traceWriter?.WriteLine(line);
+            Console.WriteLine(line);
         }
     }
 
@@ -522,6 +555,7 @@ internal sealed class CompatibilityProxy : IDisposable
         private readonly CompatibilityProxy _proxy;
         private readonly TcpListener[] _listeners;
         private readonly int _downstreamBasePort;
+        private readonly TimeSpan _downstreamConnectTimeout;
         private readonly CancellationToken _cancellationToken;
 
         public ChannelProxySession(
@@ -530,12 +564,14 @@ internal sealed class CompatibilityProxy : IDisposable
             int proxyBasePort,
             int downstreamBasePort,
             RagProtocolVersion protocol,
+            TimeSpan downstreamConnectTimeout,
             CancellationToken cancellationToken)
         {
             _proxy = proxy;
             _listeners = listeners;
             ProxyBasePort = proxyBasePort;
             _downstreamBasePort = downstreamBasePort;
+            _downstreamConnectTimeout = downstreamConnectTimeout;
             _cancellationToken = cancellationToken;
             Completion = Task.WhenAll(RunChannelAsync(0), RunChannelAsync(1), RunChannelAsync(2));
         }
@@ -564,38 +600,50 @@ internal sealed class CompatibilityProxy : IDisposable
                 _proxy.Log($"Waiting for {channelName} connection on {_proxy._options.ListenAddress}:{proxyPort} -> {_proxy._options.TargetAddress}:{downstreamPort}");
 
                 using TcpClient upstream = await listener.AcceptTcpClientAsync(_cancellationToken);
-                using TcpClient downstream = new();
-                await downstream.ConnectAsync(_proxy._options.TargetAddress, downstreamPort, _cancellationToken);
-                _proxy.Log($"{channelName} connected: game {upstream.Client.RemoteEndPoint} -> rag {_proxy._options.TargetAddress}:{downstreamPort}");
+                TcpClient? downstream = await _proxy.ConnectWithRetryAsync(
+                    _proxy._options.TargetAddress,
+                    downstreamPort,
+                    _downstreamConnectTimeout,
+                    _cancellationToken);
+                if (downstream is null)
+                {
+                    _proxy.Log($"{channelName} relay failed: unable to connect to {_proxy._options.TargetAddress}:{downstreamPort} within {_downstreamConnectTimeout.TotalSeconds:0.#}s");
+                    return;
+                }
 
-                using NetworkStream upstreamStream = upstream.GetStream();
-                using NetworkStream downstreamStream = downstream.GetStream();
+                using (downstream)
+                {
+                    _proxy.Log($"{channelName} connected: game {upstream.Client.RemoteEndPoint} -> rag {_proxy._options.TargetAddress}:{downstreamPort}");
 
-                Task upstreamToDownstream = channelName == "bank"
-                    ? _proxy.CopyBankIngressAsync(
-                        source: upstreamStream,
-                        destination: downstreamStream,
-                        directionName: $"{channelName} game->rag",
-                        cancellationToken: _cancellationToken)
-                    : _proxy.CopyRawAsync(
-                        source: upstreamStream,
-                        destination: downstreamStream,
-                        directionName: $"{channelName} game->rag",
-                        cancellationToken: _cancellationToken);
+                    using NetworkStream upstreamStream = upstream.GetStream();
+                    using NetworkStream downstreamStream = downstream.GetStream();
 
-                Task downstreamToUpstream = channelName == "bank"
-                    ? _proxy.CopyBankEgressAsync(
-                        source: downstreamStream,
-                        destination: upstreamStream,
-                        directionName: $"{channelName} rag->game",
-                        cancellationToken: _cancellationToken)
-                    : _proxy.CopyRawAsync(
-                        source: downstreamStream,
-                        destination: upstreamStream,
-                        directionName: $"{channelName} rag->game",
-                        cancellationToken: _cancellationToken);
+                    Task upstreamToDownstream = channelName == "bank"
+                        ? _proxy.CopyBankIngressAsync(
+                            source: upstreamStream,
+                            destination: downstreamStream,
+                            directionName: $"{channelName} game->rag",
+                            cancellationToken: _cancellationToken)
+                        : _proxy.CopyRawAsync(
+                            source: upstreamStream,
+                            destination: downstreamStream,
+                            directionName: $"{channelName} game->rag",
+                            cancellationToken: _cancellationToken);
 
-                await Task.WhenAny(upstreamToDownstream, downstreamToUpstream);
+                    Task downstreamToUpstream = channelName == "bank"
+                        ? _proxy.CopyBankEgressAsync(
+                            source: downstreamStream,
+                            destination: upstreamStream,
+                            directionName: $"{channelName} rag->game",
+                            cancellationToken: _cancellationToken)
+                        : _proxy.CopyRawAsync(
+                            source: downstreamStream,
+                            destination: upstreamStream,
+                            directionName: $"{channelName} rag->game",
+                            cancellationToken: _cancellationToken);
+
+                    await Task.WhenAny(upstreamToDownstream, downstreamToUpstream);
+                }
             }
             catch (OperationCanceledException)
             {

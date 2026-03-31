@@ -2,14 +2,12 @@
 
 Compatibility MITM proxy for running legacy GTA IV-era RAG traffic against newer desktop RAG tooling.
 
-It sits between the game and RAG, translates the old bootstrap/bank protocol into the newer packet formats RAG expects, and lets you trace exactly what is going in and out while debugging compatibility issues.
+It sits between the game and RAG, translates the old bootstrap/bank protocol into the newer packet formats RAG expects, and logs packet flow when `--verbose` is enabled.
 
 ## Project Layout
 
 - `X:\Repositories\RagProxy\RagProxyCompat`
   - .NET proxy application
-- `X:\Repositories\RagProxy\rag-trace.log`
-  - optional packet trace output
 
 ## Requirements
 
@@ -22,12 +20,6 @@ Debug build:
 
 ```powershell
 dotnet build X:\Repositories\RagProxy\RagProxyCompat\RagProxyCompat.csproj
-```
-
-Run the local protocol self-test:
-
-```powershell
-dotnet run --project X:\Repositories\RagProxy\RagProxyCompat\RagProxyCompat.csproj -- --self-test
 ```
 
 Publish a release-style build locally:
@@ -52,8 +44,7 @@ dotnet run --project X:\Repositories\RagProxy\RagProxyCompat\RagProxyCompat.cspr
   --target-address 127.0.0.1 `
   --target-port 2001 `
   --proxy-base-port 61000 `
-  --verbose `
-  --dump-file X:\Repositories\RagProxy\rag-trace.log
+  --verbose
 ```
 
 Meaning:
@@ -64,8 +55,6 @@ Meaning:
   - where desktop RAG is actually listening
 - `--proxy-base-port`
   - local base port used for the relayed `bank`, `output`, and `events` sockets
-- `--dump-file`
-  - append decoded traffic logs for debugging
 
 ## Patching The Game RAG Endpoint
 

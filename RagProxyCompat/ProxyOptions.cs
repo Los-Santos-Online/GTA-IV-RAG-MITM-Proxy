@@ -9,8 +9,9 @@ internal sealed record ProxyOptions(
     int TargetPort,
     int ProxyBasePortStart,
     bool Verbose,
-    string? DumpFilePath,
-    bool RunSelfTest)
+    bool ViewerEnabled,
+    int ViewerProxyBasePort,
+    int ViewerTargetBasePort)
 {
     public static ProxyOptions Parse(string[] args)
     {
@@ -41,30 +42,29 @@ internal sealed record ProxyOptions(
             Environment.Exit(0);
         }
 
-        if (values.ContainsKey("--self-test"))
-        {
-            return new ProxyOptions(IPAddress.Loopback, 2000, IPAddress.Loopback, 2001, 61000, true, null, true);
-        }
-
         IPAddress listenAddress = ParseAddress(values, "--listen-address", IPAddress.Any);
         int listenPort = ParsePort(values, "--listen-port", 2000);
         IPAddress targetAddress = ParseAddress(values, "--target-address", IPAddress.Loopback);
         int targetPort = ParsePort(values, "--target-port", 2001);
         int proxyBasePortStart = ParsePort(values, "--proxy-base-port", 61000);
         bool verbose = values.ContainsKey("--verbose");
-        string? dumpFilePath = ParseOptionalString(values, "--dump-file");
 
-        return new ProxyOptions(listenAddress, listenPort, targetAddress, targetPort, proxyBasePortStart, verbose, dumpFilePath, false);
-    }
+        bool viewerEnabled = values.ContainsKey("--viewer")
+            || values.ContainsKey("--viewer-proxy-base-port")
+            || values.ContainsKey("--viewer-target-base-port");
+        int viewerProxyBasePort = ParsePort(values, "--viewer-proxy-base-port", proxyBasePortStart);
+        int viewerTargetBasePort = ParsePort(values, "--viewer-target-base-port", 60000);
 
-    private static string? ParseOptionalString(IReadOnlyDictionary<string, string?> values, string key)
-    {
-        if (!values.TryGetValue(key, out string? value) || string.IsNullOrWhiteSpace(value))
-        {
-            return null;
-        }
-
-        return value;
+        return new ProxyOptions(
+            listenAddress,
+            listenPort,
+            targetAddress,
+            targetPort,
+            proxyBasePortStart,
+            verbose,
+            viewerEnabled,
+            viewerProxyBasePort,
+            viewerTargetBasePort);
     }
 
     private static IPAddress ParseAddress(IReadOnlyDictionary<string, string?> values, string key, IPAddress fallback)
@@ -107,9 +107,10 @@ internal sealed record ProxyOptions(
         Console.WriteLine("  --target-address <ip>   Modern RAG endpoint. Default: 127.0.0.1");
         Console.WriteLine("  --target-port <port>    Modern RAG handshake port. Default: 2001");
         Console.WriteLine("  --proxy-base-port <p>   First local port for proxied bank/output/events triplets. Default: 61000");
+        Console.WriteLine("  --viewer               Enable ragviewer relay (no handshake).");
+        Console.WriteLine("  --viewer-proxy-base-port <p>  Base port exposed to legacy ragviewer. Default: --proxy-base-port");
+        Console.WriteLine("  --viewer-target-base-port <p> Base port on modern RAG viewer. Default: 60000");
         Console.WriteLine("  --verbose               Print packet flow.");
-        Console.WriteLine("  --dump-file <path>      Append raw packet traces to a log file.");
-        Console.WriteLine("  --self-test             Run local protocol checks and exit.");
         Console.WriteLine("  --help                  Show this help.");
     }
 }

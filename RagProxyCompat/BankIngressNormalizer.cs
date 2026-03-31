@@ -1,19 +1,30 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 
 namespace RagProxyCompat;
 
 internal sealed class BankIngressNormalizer
 {
-    private readonly BankPayloadNormalizer _normalizer = new(BankPayloadDirection.GameToRag);
+    private readonly BankPayloadNormalizer _normalizer;
+
+    public BankIngressNormalizer(Action<string>? alert = null)
+    {
+        _normalizer = new BankPayloadNormalizer(BankPayloadDirection.GameToRag, alert);
+    }
 
     public IReadOnlyList<byte[]> ProcessChunk(ReadOnlySpan<byte> chunk) => _normalizer.ProcessChunk(chunk);
 }
 
 internal sealed class BankEgressNormalizer
 {
-    private readonly BankPayloadNormalizer _normalizer = new(BankPayloadDirection.RagToGame);
+    private readonly BankPayloadNormalizer _normalizer;
+
+    public BankEgressNormalizer(Action<string>? alert = null)
+    {
+        _normalizer = new BankPayloadNormalizer(BankPayloadDirection.RagToGame, alert);
+    }
 
     public IReadOnlyList<byte[]> ProcessChunk(ReadOnlySpan<byte> chunk) => _normalizer.ProcessChunk(chunk);
 }
@@ -33,17 +44,51 @@ internal sealed class BankPayloadNormalizer
     private const ushort BankCommandUser5 = 10;
     private const int WidgetTextStringType = 4;
     private static readonly byte[] DefaultWidgetColorField = EncodeLegacyString("ARGBColor:0:0:0:0");
+    private static readonly Dictionary<string, WidgetGroup> WidgetGroupByPrefix = new(StringComparer.Ordinal)
+    {
+        ["bmgr"] = WidgetGroup.BankManager,
+        ["bank"] = WidgetGroup.BankOrGroup,
+        ["grup"] = WidgetGroup.BankOrGroup,
+        ["text"] = WidgetGroup.Text,
+        ["vclr"] = WidgetGroup.Color,
+        ["butn"] = WidgetGroup.Button,
+        ["tgbo"] = WidgetGroup.Button,
+        ["tgs3"] = WidgetGroup.Button,
+        ["tgu8"] = WidgetGroup.Button,
+        ["tgu1"] = WidgetGroup.Button,
+        ["tgu3"] = WidgetGroup.Button,
+        ["tgbs"] = WidgetGroup.Button,
+        ["tgfb"] = WidgetGroup.Button,
+        ["tgfl"] = WidgetGroup.Button,
+        ["slfl"] = WidgetGroup.Slider,
+        ["slu8"] = WidgetGroup.Slider,
+        ["sls8"] = WidgetGroup.Slider,
+        ["slu1"] = WidgetGroup.Slider,
+        ["sls1"] = WidgetGroup.Slider,
+        ["slu3"] = WidgetGroup.Slider,
+        ["sls3"] = WidgetGroup.Slider,
+        ["cou8"] = WidgetGroup.Combo,
+        ["cos8"] = WidgetGroup.Combo,
+        ["cou1"] = WidgetGroup.Combo,
+        ["cos1"] = WidgetGroup.Combo,
+        ["cou3"] = WidgetGroup.Combo,
+        ["cos3"] = WidgetGroup.Combo,
+    };
 
     private readonly BankPayloadDirection _direction;
+    private readonly Action<string>? _alert;
     private byte[] _streamBuffer = Array.Empty<byte>();
     private int _streamCount;
     private BankIngressMode _mode;
     private uint _bankManagerId;
     private bool _startupCompatPacketsInjected;
+    private readonly Queue<byte[]> _pendingOutputs = new();
+    private readonly HashSet<string> _unknownWidgetGuids = new(StringComparer.Ordinal);
 
-    public BankPayloadNormalizer(BankPayloadDirection direction)
+    public BankPayloadNormalizer(BankPayloadDirection direction, Action<string>? alert)
     {
         _direction = direction;
+        _alert = alert;
     }
 
     public IReadOnlyList<byte[]> ProcessChunk(ReadOnlySpan<byte> chunk)
@@ -67,6 +112,12 @@ internal sealed class BankPayloadNormalizer
 
     private bool TryReadNextOutput(out byte[] output)
     {
+        if (_pendingOutputs.Count > 0)
+        {
+            output = _pendingOutputs.Dequeue();
+            return true;
+        }
+
         output = Array.Empty<byte>();
 
     Restart:
@@ -89,7 +140,12 @@ internal sealed class BankPayloadNormalizer
                     {
                         case CompressionParseStatus.Success:
                             byte[] frame = Consume(ref _streamBuffer, ref _streamCount, consumed);
-                            output = TranslateFramedSegment(frame);
+                            IReadOnlyList<byte[]> translatedFrames = TranslateFramedSegment(frame);
+                            EnqueueOutputs(translatedFrames);
+                            if (_pendingOutputs.Count > 0)
+                            {
+                                output = _pendingOutputs.Dequeue();
+                            }
                             return true;
 
                         case CompressionParseStatus.NeedMoreData:
@@ -115,11 +171,28 @@ internal sealed class BankPayloadNormalizer
                     return false;
                 }
 
-                output = TranslatePacketStream(completePackets, GetPacketStreamFormat(_mode));
+                IReadOnlyList<byte[]> translatedPackets = TranslatePacketStreamToOutputs(completePackets, GetPacketStreamFormat(_mode));
+                EnqueueOutputs(translatedPackets);
+                if (_pendingOutputs.Count > 0)
+                {
+                    output = _pendingOutputs.Dequeue();
+                }
                 return true;
 
             default:
                 throw new UnreachableException();
+        }
+    }
+
+    private void EnqueueOutputs(IReadOnlyList<byte[]> outputs)
+    {
+        for (int i = 0; i < outputs.Count; i++)
+        {
+            byte[] output = outputs[i];
+            if (output.Length > 0)
+            {
+                _pendingOutputs.Enqueue(output);
+            }
         }
     }
 
@@ -184,7 +257,7 @@ internal sealed class BankPayloadNormalizer
         };
     }
 
-    private byte[] TranslateFramedSegment(byte[] frame)
+    private IReadOnlyList<byte[]> TranslateFramedSegment(byte[] frame)
     {
         ReadOnlySpan<byte> source = frame;
         CompressionKind kind = DetectCompressionKind(source[..4]);
@@ -205,8 +278,34 @@ internal sealed class BankPayloadNormalizer
 
         PacketStreamFormat packetFormat = DetectPacketStreamFormat(payload);
         return packetFormat == PacketStreamFormat.Unknown
-            ? frame
-            : TranslatePacketStream(payload, packetFormat);
+            ? [frame]
+            : TranslatePacketStreamToOutputs(payload, packetFormat);
+    }
+
+    private IReadOnlyList<byte[]> TranslatePacketStreamToOutputs(ReadOnlySpan<byte> rawPackets, PacketStreamFormat inputFormat)
+    {
+        byte[] translatedStream = TranslatePacketStream(rawPackets, inputFormat);
+        if (translatedStream.Length == 0)
+        {
+            return Array.Empty<byte[]>();
+        }
+
+        PacketStreamFormat outputFormat = _direction == BankPayloadDirection.GameToRag
+            ? PacketStreamFormat.Modern12
+            : PacketStreamFormat.Legacy8;
+
+        List<byte[]> packets = SplitPacketStream(translatedStream, outputFormat);
+        if (_direction != BankPayloadDirection.GameToRag)
+        {
+            return packets;
+        }
+
+        for (int i = 0; i < packets.Count; i++)
+        {
+            packets[i] = WrapNoCompression(packets[i]);
+        }
+
+        return packets;
     }
 
     private byte[] TranslatePacketStream(ReadOnlySpan<byte> rawPackets, PacketStreamFormat inputFormat)
@@ -216,6 +315,7 @@ internal sealed class BankPayloadNormalizer
             : PacketStreamFormat.Legacy8;
 
         List<byte> translated = new(rawPackets.Length + 256);
+        Span<byte> legacyIdPrefix = stackalloc byte[sizeof(uint)];
         int offset = 0;
         int headerSize = inputFormat == PacketStreamFormat.Legacy8 ? LegacyPacketHeaderSize : ModernPacketHeaderSize;
         while (offset + headerSize <= rawPackets.Length)
@@ -253,7 +353,6 @@ internal sealed class BankPayloadNormalizer
             }
             else
             {
-                Span<byte> legacyIdPrefix = stackalloc byte[sizeof(uint)];
                 ReadOnlySpan<byte> legacyPayload = payload;
                 if (inputFormat == PacketStreamFormat.Modern12)
                 {
@@ -275,10 +374,7 @@ internal sealed class BankPayloadNormalizer
             offset += header.TotalLength;
         }
 
-        byte[] packetBytes = translated.ToArray();
-        return _direction == BankPayloadDirection.GameToRag
-            ? WrapNoCompression(packetBytes)
-            : packetBytes;
+        return translated.ToArray();
     }
 
     private void MaybeAppendCompatStartupPackets(List<byte> destination, ushort modernCommand, int guid, uint id)
@@ -327,7 +423,7 @@ internal sealed class BankPayloadNormalizer
         }
     }
 
-    private static bool TryAppendTranslatedLegacyCreatePackets(
+    private bool TryAppendTranslatedLegacyCreatePackets(
         List<byte> destination,
         ushort command,
         int guid,
@@ -339,64 +435,50 @@ internal sealed class BankPayloadNormalizer
             return false;
         }
 
-        string widgetGuid = FourCcToString(guid);
-        switch (widgetGuid)
+        WidgetGroup group = ResolveWidgetGroup(guid, command, "legacy->modern create");
+        switch (group)
         {
-            case "text":
+            case WidgetGroup.Text:
                 if (command != BankCommandCreate)
                 {
                     return false;
                 }
                 return TryAppendTranslatedLegacyTextCreate(destination, command, guid, id, payload);
 
-            case "vclr":
+            case WidgetGroup.Color:
                 if (command != BankCommandCreate)
                 {
                     return false;
                 }
                 return TryAppendTranslatedLegacyColorCreate(destination, guid, id, payload);
 
-            case "bank":
-            case "grup":
+            case WidgetGroup.BankOrGroup:
                 if (command != BankCommandCreate)
                 {
                     return false;
                 }
                 return TryAppendTranslatedLegacyBankOrGroupCreate(destination, guid, id, payload);
 
-            case "slfl":
-            case "slu8":
-            case "sls8":
-            case "slu1":
-            case "sls1":
-            case "slu3":
-            case "sls3":
+            case WidgetGroup.Slider:
                 if (command != BankCommandCreate)
                 {
                     return false;
                 }
-                return TryAppendTranslatedLegacySimpleCreate(destination, command, guid, id, payload);
+                return TryAppendTranslatedLegacySimpleCreate(destination, command, guid, id, payload, appendExponentialFlag: true);
 
-            case "butn":
-            case "tgbo":
-            case "tgs3":
-            case "tgu8":
-            case "tgu1":
-            case "tgu3":
-            case "tgbs":
-            case "tgfb":
-            case "tgfl":
-            case "cou8":
-            case "cos8":
-            case "cou1":
-            case "cos1":
-            case "cou3":
-            case "cos3":
+            case WidgetGroup.Combo:
                 if (command != BankCommandCreate && command != BankCommandLegacyComboCreate)
                 {
                     return false;
                 }
                 return TryAppendTranslatedLegacyComboCreate(destination, guid, id, payload);
+
+            case WidgetGroup.Button:
+                if (command != BankCommandCreate)
+                {
+                    return false;
+                }
+                return TryAppendTranslatedLegacySimpleCreate(destination, command, guid, id, payload, appendExponentialFlag: false);
 
             default:
                 return false;
@@ -560,12 +642,13 @@ internal sealed class BankPayloadNormalizer
         return true;
     }
 
-    private static bool TryAppendTranslatedLegacySimpleCreate(
+    private bool TryAppendTranslatedLegacySimpleCreate(
         List<byte> destination,
         ushort command,
         int guid,
         uint id,
-        ReadOnlySpan<byte> payload)
+        ReadOnlySpan<byte> payload,
+        bool appendExponentialFlag)
     {
         if (payload.Length < sizeof(uint))
         {
@@ -586,10 +669,10 @@ internal sealed class BankPayloadNormalizer
         uint remoteParent = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(0, sizeof(uint)));
         ReadOnlySpan<byte> legacyTail = payload.Slice(tailOffset);
         string memo = string.Empty;
-        if (TrySplitOptionalLegacyMemo(legacyTail, out string? parsedMemo, out ReadOnlySpan<byte> numericTail))
+        if (TrySplitOptionalLegacyMemo(legacyTail, out string? parsedMemo, out ReadOnlySpan<byte> memoTrimmedTail))
         {
             memo = parsedMemo ?? string.Empty;
-            legacyTail = numericTail;
+            legacyTail = memoTrimmedTail;
         }
 
         List<byte> createPayload = new(payload.Length + 24);
@@ -600,10 +683,26 @@ internal sealed class BankPayloadNormalizer
         AddBytes(createPayload, EncodeLegacyString(memo));
         AddBytes(createPayload, DefaultWidgetColorField);
         createPayload.Add(0); // readOnly = false
-        AddBytes(createPayload, legacyTail);
-        if (RequiresAppendedLegacySliderExponentialFlag(legacyTail))
+        ReadOnlySpan<byte> numericTail = legacyTail;
+        byte? exponentialFlag = null;
+        if (appendExponentialFlag)
         {
-            createPayload.Add(0); // exponential = false
+            int expectedNumericLength = GetLegacySliderNumericLength(guid);
+            numericTail = ExtractLegacySliderExponentialFlag(legacyTail, expectedNumericLength, out exponentialFlag);
+            LogSliderTranslation("legacy->modern create", guid, legacyTail, numericTail, exponentialFlag, expectedNumericLength);
+        }
+
+        AddBytes(createPayload, numericTail);
+        if (appendExponentialFlag)
+        {
+            if (exponentialFlag.HasValue)
+            {
+                createPayload.Add(exponentialFlag.Value);
+            }
+            else if (RequiresAppendedLegacySliderExponentialFlag(legacyTail))
+            {
+                createPayload.Add(0); // exponential = false
+            }
         }
 
         AppendModernPacket(destination, BankCommandCreate, guid, id, createPayload.ToArray());
@@ -804,7 +903,7 @@ internal sealed class BankPayloadNormalizer
         return offset == source.Length;
     }
 
-    private static bool TryReadPacketHeader(ReadOnlySpan<byte> source, PacketStreamFormat format, out BankPacketHeader header)
+    private static bool TryReadPacketHeader(ReadOnlySpan<byte> source, PacketStreamFormat format, out BankPacketHeader header, bool requireFourCc = true)
     {
         header = default;
         int headerSize = format == PacketStreamFormat.Legacy8 ? LegacyPacketHeaderSize : ModernPacketHeaderSize;
@@ -831,7 +930,7 @@ internal sealed class BankPayloadNormalizer
             ? BinaryPrimitives.ReadUInt32LittleEndian(source.Slice(8, sizeof(uint)))
             : 0;
 
-        if (format == PacketStreamFormat.Modern12 && !LooksLikeFourCc(source.Slice(4, sizeof(int))))
+        if (requireFourCc && format == PacketStreamFormat.Modern12 && !LooksLikeFourCc(source.Slice(4, sizeof(int))))
         {
             return false;
         }
@@ -840,47 +939,247 @@ internal sealed class BankPayloadNormalizer
         return true;
     }
 
-    private static ushort TranslateLegacyCommand(ushort command, int guid)
+    private static List<byte[]> SplitPacketStream(ReadOnlySpan<byte> stream, PacketStreamFormat format)
     {
-        string widgetGuid = FourCcToString(guid);
-        return widgetGuid switch
+        List<byte[]> packets = [];
+        if (stream.IsEmpty)
         {
-            "bmgr" when command == 2 => 7, // USER_2 / init finished on modern RAG
-            "bmgr" when command == 8 => 10, // USER_5 / time string on modern RAG
-            "grup" or "bank" when command == 2 => 5, // USER_0 / open-state update on modern RAG
-            "cou8" or "cos8" or "cou1" or "cos1" or "cou3" or "cos3"
-                when command == 3 => 5, // USER_0 in modern RAG
-            "cou8" or "cos8" or "cou1" or "cos1" or "cou3" or "cos3"
-                when command == 4 => 0, // CREATE in modern RAG
+            return packets;
+        }
+
+        int offset = 0;
+        int headerSize = format == PacketStreamFormat.Legacy8 ? LegacyPacketHeaderSize : ModernPacketHeaderSize;
+        while (offset + headerSize <= stream.Length)
+        {
+            if (!TryReadPacketHeader(stream.Slice(offset), format, out BankPacketHeader header, requireFourCc: false))
+            {
+                throw new InvalidOperationException("Translated bank packet stream is invalid.");
+            }
+
+            int totalLength = header.TotalLength;
+            packets.Add(stream.Slice(offset, totalLength).ToArray());
+            offset += totalLength;
+        }
+
+        if (offset != stream.Length)
+        {
+            throw new InvalidOperationException("Translated bank packet stream is truncated.");
+        }
+
+        return packets;
+    }
+
+    private WidgetGroup ResolveWidgetGroup(int guid, ushort command, string context)
+    {
+        if (TryGetWidgetGroup(guid, out WidgetGroup group, out _))
+        {
+            return group;
+        }
+
+        MaybeAlertUnknownWidget(guid, command, context);
+        return WidgetGroup.Unknown;
+    }
+
+    private void MaybeAlertUnknownWidget(int guid, ushort command, string context)
+    {
+        string label = FormatGuidForLog(guid);
+        if (_unknownWidgetGuids.Add(label))
+        {
+            _alert?.Invoke($"Unrecognized bank widget prefix {label} in {DescribeDirection()} {context} cmd={command}. Add translation if needed.");
+        }
+    }
+
+    private string DescribeDirection()
+    {
+        return _direction == BankPayloadDirection.GameToRag ? "legacy->modern" : "modern->legacy";
+    }
+
+    private static bool TryGetWidgetGroup(int guid, out WidgetGroup group, out string label)
+    {
+        group = WidgetGroup.Unknown;
+        if (!TryGetFourCcLabel(guid, out label))
+        {
+            return false;
+        }
+
+        return WidgetGroupByPrefix.TryGetValue(label, out group);
+    }
+
+    private static bool TryGetFourCcLabel(int guid, out string label)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, guid);
+        if (!LooksLikeFourCc(bytes))
+        {
+            label = string.Empty;
+            return false;
+        }
+
+        label = Encoding.ASCII.GetString(bytes);
+        return true;
+    }
+
+    private static string FormatGuidForLog(int guid)
+    {
+        return TryGetFourCcLabel(guid, out string label) ? $"'{label}'" : $"0x{guid:X8}";
+    }
+
+    private static int GetLegacySliderNumericLength(int guid)
+    {
+        int size = GetLegacySliderNumericSize(guid);
+        return size == 0 ? 0 : size * 4;
+    }
+
+    private static int GetLegacySliderNumericSize(int guid)
+    {
+        if (!TryGetFourCcLabel(guid, out string label))
+        {
+            return 0;
+        }
+
+        return label switch
+        {
+            "slfl" => 4,
+            "slu8" or "sls8" => 1,
+            "slu1" or "sls1" => 2,
+            "slu3" or "sls3" => 4,
+            _ => 0
+        };
+    }
+
+    private void LogSliderTranslation(
+        string context,
+        int guid,
+        ReadOnlySpan<byte> legacyTail,
+        ReadOnlySpan<byte> numericTail,
+        byte? exponentialFlag,
+        int expectedNumericLength)
+    {
+        if (_alert is null)
+        {
+            return;
+        }
+
+        string label = FormatGuidForLog(guid);
+        string legacyHex = Convert.ToHexString(legacyTail.ToArray());
+        string numericHex = Convert.ToHexString(numericTail.ToArray());
+        string values = DescribeSliderValues(guid, numericTail);
+        string flag = exponentialFlag.HasValue ? exponentialFlag.Value.ToString(CultureInfo.InvariantCulture) : "none";
+
+        _alert($"slider {label} {context}: tailLen={legacyTail.Length} numericLen={numericTail.Length} expectedLen={expectedNumericLength} expFlag={flag} {values} tailHex={legacyHex} numericHex={numericHex}");
+    }
+
+    private static string DescribeSliderValues(int guid, ReadOnlySpan<byte> numericTail)
+    {
+        if (TryGetFourCcLabel(guid, out string label) && label == "slfl")
+        {
+            return DescribeSliderFloats(numericTail);
+        }
+
+        int size = GetLegacySliderNumericSize(guid);
+        return size switch
+        {
+            1 => DescribeSliderInts(numericTail, 1),
+            2 => DescribeSliderInts(numericTail, 2),
+            4 => DescribeSliderInts(numericTail, 4),
+            _ => "values=unavailable"
+        };
+    }
+
+    private static string DescribeSliderFloats(ReadOnlySpan<byte> numericTail)
+    {
+        const int floatBytes = sizeof(float) * 4;
+        if (numericTail.Length < floatBytes)
+        {
+            return $"floats=unavailable";
+        }
+
+        float value = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(numericTail.Slice(0, sizeof(float))));
+        float min = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(numericTail.Slice(sizeof(float), sizeof(float))));
+        float max = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(numericTail.Slice(sizeof(float) * 2, sizeof(float))));
+        float step = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(numericTail.Slice(sizeof(float) * 3, sizeof(float))));
+
+        return $"floats=value={value.ToString("G9", CultureInfo.InvariantCulture)} min={min.ToString("G9", CultureInfo.InvariantCulture)} max={max.ToString("G9", CultureInfo.InvariantCulture)} step={step.ToString("G9", CultureInfo.InvariantCulture)}";
+    }
+
+    private static string DescribeSliderInts(ReadOnlySpan<byte> numericTail, int size)
+    {
+        int needed = size * 4;
+        if (numericTail.Length < needed)
+        {
+            return "ints=unavailable";
+        }
+
+        long value = ReadSignedInteger(numericTail.Slice(0, size), size);
+        long min = ReadSignedInteger(numericTail.Slice(size, size), size);
+        long max = ReadSignedInteger(numericTail.Slice(size * 2, size), size);
+        long step = ReadSignedInteger(numericTail.Slice(size * 3, size), size);
+
+        return $"ints=value={value} min={min} max={max} step={step}";
+    }
+
+    private static long ReadSignedInteger(ReadOnlySpan<byte> bytes, int size)
+    {
+        return size switch
+        {
+            1 => (sbyte)bytes[0],
+            2 => BinaryPrimitives.ReadInt16LittleEndian(bytes),
+            4 => BinaryPrimitives.ReadInt32LittleEndian(bytes),
+            _ => 0
+        };
+    }
+
+    private ushort TranslateLegacyCommand(ushort command, int guid)
+    {
+        WidgetGroup group = ResolveWidgetGroup(guid, command, "legacy->modern command");
+        return group switch
+        {
+            WidgetGroup.BankManager when command == 2 => 7, // USER_2 / init finished on modern RAG
+            WidgetGroup.BankManager when command == 8 => 10, // USER_5 / time string on modern RAG
+            WidgetGroup.BankOrGroup when command == 2 => 5, // USER_0 / open-state update on modern RAG
+            WidgetGroup.Combo when command == 3 => 5, // USER_0 in modern RAG
+            WidgetGroup.Combo when command == 4 => 0, // CREATE in modern RAG
             _ => command
         };
     }
 
-    private static bool LegacyPacketHasIdPrefix(ushort command, int guid, ReadOnlySpan<byte> payload)
+    private bool LegacyPacketHasIdPrefix(ushort command, int guid, ReadOnlySpan<byte> payload)
     {
         if (payload.Length < sizeof(uint))
         {
             return false;
         }
 
-        string widgetGuid = FourCcToString(guid);
-        return widgetGuid switch
+        WidgetGroup group = ResolveWidgetGroup(guid, command, "legacy->modern id prefix");
+        return group switch
         {
-            "bmgr" when command == 8 => false, // timing/status string
+            WidgetGroup.BankManager when command == 8 => false, // timing/status string
             _ => true
         };
     }
 
-    private static bool ShouldDropModernToLegacyPacket(ushort command, int guid, uint id, ReadOnlySpan<byte> payload)
+    private bool ShouldDropModernToLegacyPacket(ushort command, int guid, uint id, ReadOnlySpan<byte> payload)
     {
-        string widgetGuid = FourCcToString(guid);
-        return widgetGuid switch
+        WidgetGroup group = ResolveWidgetGroup(guid, command, "modern->legacy drop");
+        return group switch
         {
-            "bmgr" when command == 5 => true,  // modern USER_0/file-dialog path not supported by GTA IV bank manager
-            "bmgr" when command == 8 => true,  // modern USER_3 window-handle packet is proxy-only; GTA IV treats legacy cmd 8 as a time-string path
-            "bmgr" when command == 11 => true, // modern USER_6 ping path currently rejected by GTA IV runtime
+            WidgetGroup.BankManager when command == 5 => true,  // modern USER_0/file-dialog path not supported by GTA IV bank manager
+            WidgetGroup.BankManager when command == 8 => true,  // modern USER_3 window-handle packet is proxy-only; GTA IV treats legacy cmd 8 as a time-string path
+            WidgetGroup.BankManager when command == 11 => true, // modern USER_6 ping path currently rejected by GTA IV runtime
             _ => false
         };
+    }
+
+    private enum WidgetGroup
+    {
+        Unknown,
+        BankManager,
+        BankOrGroup,
+        Combo,
+        Button,
+        Slider,
+        Text,
+        Color,
     }
 
     private static void AppendLegacyPacket(List<byte> destination, ushort command, int guid, ReadOnlySpan<byte> idPrefix, ReadOnlySpan<byte> payload)
@@ -1023,29 +1322,25 @@ internal sealed class BankPayloadNormalizer
         return wrapped;
     }
 
-    private static ReadOnlySpan<byte> TransformLegacyCreatePayload(ushort command, int guid, ReadOnlySpan<byte> payload)
+    private ReadOnlySpan<byte> TransformLegacyCreatePayload(ushort command, int guid, ReadOnlySpan<byte> payload)
     {
         if (command != 0 || payload.Length < sizeof(uint))
         {
             return payload;
         }
 
-        string widgetGuid = FourCcToString(guid);
-        return widgetGuid switch
+        WidgetGroup group = ResolveWidgetGroup(guid, command, "legacy->modern payload");
+        return group switch
         {
-            "butn" or "tgbo"
-            or "tgs3" or "tgu8" or "tgu1" or "tgu3" or "tgbs" or "tgfb" or "tgfl"
-                => RewriteLegacySimpleCreatePayload(payload),
-            "cou8" or "cos8" or "cou1" or "cos1" or "cou3" or "cos3"
-                => RewriteLegacyComboCreatePayload(payload),
-            "slfl" or "slu8" or "sls8" or "slu1" or "sls1" or "slu3" or "sls3"
-                => RewriteLegacySimpleCreatePayload(payload),
-            "bank" or "grup" => RewriteLegacyBankOrGroupCreatePayload(payload),
-            "text" => RewriteLegacyTextCreatePayload(payload),
-            "vclr" => RewriteLegacyColorCreatePayload(payload),
-            _ when TryGetLegacyString(payload.Slice(sizeof(uint)), out _, out _)
+            WidgetGroup.Button => RewriteLegacySimpleCreatePayload(payload, guid, appendExponentialFlag: false),
+            WidgetGroup.Combo => RewriteLegacyComboCreatePayload(payload),
+            WidgetGroup.Slider => RewriteLegacySimpleCreatePayload(payload, guid, appendExponentialFlag: true),
+            WidgetGroup.BankOrGroup => RewriteLegacyBankOrGroupCreatePayload(payload),
+            WidgetGroup.Text => RewriteLegacyTextCreatePayload(payload),
+            WidgetGroup.Color => RewriteLegacyColorCreatePayload(payload),
+            WidgetGroup.Unknown when TryGetLegacyString(payload.Slice(sizeof(uint)), out _, out _)
                 => InsertFieldAfterFirstString(payload, DefaultWidgetColorField),
-            _ => payload,
+            _ => payload
         };
     }
 
@@ -1209,7 +1504,7 @@ internal sealed class BankPayloadNormalizer
         return createPayload.ToArray();
     }
 
-    private static ReadOnlySpan<byte> RewriteLegacySimpleCreatePayload(ReadOnlySpan<byte> payload)
+    private ReadOnlySpan<byte> RewriteLegacySimpleCreatePayload(ReadOnlySpan<byte> payload, int guid, bool appendExponentialFlag)
     {
         if (payload.Length < sizeof(uint))
         {
@@ -1230,10 +1525,10 @@ internal sealed class BankPayloadNormalizer
         uint remoteParent = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(0, sizeof(uint)));
         ReadOnlySpan<byte> legacyTail = payload.Slice(tailOffset);
         string memo = string.Empty;
-        if (TrySplitOptionalLegacyMemo(legacyTail, out string? parsedMemo, out ReadOnlySpan<byte> numericTail))
+        if (TrySplitOptionalLegacyMemo(legacyTail, out string? parsedMemo, out ReadOnlySpan<byte> memoTrimmedTail))
         {
             memo = parsedMemo ?? string.Empty;
-            legacyTail = numericTail;
+            legacyTail = memoTrimmedTail;
         }
 
         List<byte> createPayload = new(payload.Length + 24);
@@ -1244,10 +1539,26 @@ internal sealed class BankPayloadNormalizer
         AddBytes(createPayload, EncodeLegacyString(memo));
         AddBytes(createPayload, DefaultWidgetColorField);
         createPayload.Add(0); // readOnly = false
-        AddBytes(createPayload, legacyTail);
-        if (RequiresAppendedLegacySliderExponentialFlag(legacyTail))
+        ReadOnlySpan<byte> numericTail = legacyTail;
+        byte? exponentialFlag = null;
+        if (appendExponentialFlag)
         {
-            createPayload.Add(0); // exponential = false
+            int expectedNumericLength = GetLegacySliderNumericLength(guid);
+            numericTail = ExtractLegacySliderExponentialFlag(legacyTail, expectedNumericLength, out exponentialFlag);
+            LogSliderTranslation("legacy->modern payload", guid, legacyTail, numericTail, exponentialFlag, expectedNumericLength);
+        }
+
+        AddBytes(createPayload, numericTail);
+        if (appendExponentialFlag)
+        {
+            if (exponentialFlag.HasValue)
+            {
+                createPayload.Add(exponentialFlag.Value);
+            }
+            else if (RequiresAppendedLegacySliderExponentialFlag(legacyTail))
+            {
+                createPayload.Add(0); // exponential = false
+            }
         }
 
         return createPayload.ToArray();
@@ -1359,6 +1670,39 @@ internal sealed class BankPayloadNormalizer
     private static bool RequiresAppendedLegacySliderExponentialFlag(ReadOnlySpan<byte> legacyTail)
     {
         return !legacyTail.IsEmpty && (legacyTail.Length % sizeof(uint)) == 0;
+    }
+
+    private static ReadOnlySpan<byte> ExtractLegacySliderExponentialFlag(ReadOnlySpan<byte> legacyTail, int expectedNumericLength, out byte? exponentialFlag)
+    {
+        exponentialFlag = null;
+        if (expectedNumericLength <= 0)
+        {
+            return legacyTail;
+        }
+
+        if (legacyTail.Length == expectedNumericLength)
+        {
+            return legacyTail;
+        }
+
+        if (legacyTail.Length == expectedNumericLength + 1)
+        {
+            byte leading = legacyTail[0];
+            if (leading <= 1)
+            {
+                exponentialFlag = leading;
+                return legacyTail.Slice(1);
+            }
+
+            byte trailing = legacyTail[^1];
+            if (trailing <= 1)
+            {
+                exponentialFlag = trailing;
+                return legacyTail.Slice(0, expectedNumericLength);
+            }
+        }
+
+        return legacyTail;
     }
 
     private static bool IsColorField(string? value)
@@ -1646,245 +1990,4 @@ internal static class FiCompression
 
         return result;
     }
-}
-
-internal static class BankTraceDecoder
-{
-    private const int LegacyPacketHeaderSize = 8;
-    private const int ModernPacketHeaderSize = 12;
-    private const ushort MaxRemotePacketCommand = 16 * 1024;
-
-    public static IReadOnlyList<string> DescribeChunk(ReadOnlySpan<byte> bytes)
-    {
-        List<string> lines = [];
-        if (bytes.Length < 4)
-        {
-            return lines;
-        }
-
-        if (bytes.StartsWith("CHN:"u8))
-        {
-            if (bytes.Length < 9)
-            {
-                lines.Add("frame=CHN incomplete");
-                return lines;
-            }
-
-            int payloadLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(4, sizeof(uint))));
-            if (bytes.Length < 9 + payloadLength)
-            {
-                lines.Add($"frame=CHN incomplete payload={payloadLength} actual={Math.Max(0, bytes.Length - 9)}");
-                return lines;
-            }
-
-            DescribePacketStream(bytes.Slice(9, payloadLength), lines, "frame=CHN");
-            return lines;
-        }
-
-        if (bytes.StartsWith("CHD:"u8) || bytes.StartsWith("CHF:"u8))
-        {
-            string frameKind = bytes.StartsWith("CHD:"u8) ? "CHD" : "CHF";
-            if (bytes.Length < 14)
-            {
-                lines.Add($"frame={frameKind} incomplete");
-                return lines;
-            }
-
-            int compressedLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(4, sizeof(uint))));
-            int decompressedLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(9, sizeof(uint))));
-            if (bytes.Length < 14 + compressedLength)
-            {
-                lines.Add($"frame={frameKind} incomplete compressed={compressedLength} actual={Math.Max(0, bytes.Length - 14)} decompressed={decompressedLength}");
-                return lines;
-            }
-
-            byte[] payload;
-            try
-            {
-                byte[] compressedPayload = bytes.Slice(14, compressedLength).ToArray();
-                payload = frameKind == "CHD"
-                    ? DecompressDatPayload(compressedPayload, decompressedLength)
-                    : DecompressFiPayload(compressedPayload, decompressedLength);
-            }
-            catch (Exception ex)
-            {
-                lines.Add($"frame={frameKind} decompress-failed {ex.GetType().Name}: {ex.Message}");
-                return lines;
-            }
-
-            DescribePacketStream(payload, lines, $"frame={frameKind}");
-            return lines;
-        }
-
-        PacketStreamFormat format = DetectPacketStreamFormat(bytes);
-        if (format != PacketStreamFormat.Unknown)
-        {
-            DescribePacketStream(bytes, lines, $"raw={format}");
-        }
-
-        return lines;
-    }
-
-    private static void DescribePacketStream(ReadOnlySpan<byte> payload, List<string> lines, string prefix)
-    {
-        PacketStreamFormat format = DetectPacketStreamFormat(payload);
-        if (format == PacketStreamFormat.Unknown)
-        {
-            lines.Add($"{prefix} stream=unknown bytes={payload.Length}");
-            return;
-        }
-
-        int offset = 0;
-        int index = 0;
-        int headerSize = format == PacketStreamFormat.Legacy8 ? LegacyPacketHeaderSize : ModernPacketHeaderSize;
-        lines.Add($"{prefix} stream={format} bytes={payload.Length}");
-        while (offset + headerSize <= payload.Length)
-        {
-            if (!TryReadPacketHeader(payload.Slice(offset), format, out TracePacketHeader header))
-            {
-                lines.Add($"{prefix} packet[{index}] invalid-header offset={offset}");
-                break;
-            }
-
-            if (offset + header.TotalLength > payload.Length)
-            {
-                lines.Add($"{prefix} packet[{index}] truncated offset={offset} need={header.TotalLength} remain={payload.Length - offset}");
-                break;
-            }
-
-            ReadOnlySpan<byte> packetPayload = payload.Slice(offset + headerSize, header.PayloadLength);
-            lines.Add($"{prefix} packet[{index}] cmd={header.Command} guid='{FourCcToString(header.Guid)}' id={header.Id} len={header.PayloadLength} preview='{BuildPreview(packetPayload)}'");
-            offset += header.TotalLength;
-            index++;
-        }
-
-        if (offset == payload.Length)
-        {
-            lines.Add($"{prefix} packets={index}");
-        }
-    }
-
-    private static string BuildPreview(ReadOnlySpan<byte> payload)
-    {
-        int maxBytes = Math.Min(payload.Length, 64);
-        StringBuilder builder = new(maxBytes);
-        for (int i = 0; i < maxBytes; i++)
-        {
-            byte b = payload[i];
-            if (b == 0)
-            {
-                builder.Append('·');
-            }
-            else if (b >= 32 && b <= 126)
-            {
-                builder.Append((char)b);
-            }
-            else
-            {
-                builder.Append('.');
-            }
-        }
-
-        return builder.ToString();
-    }
-
-    private static bool TryReadPacketHeader(ReadOnlySpan<byte> source, PacketStreamFormat format, out TracePacketHeader header)
-    {
-        header = default;
-        int headerSize = format == PacketStreamFormat.Legacy8 ? LegacyPacketHeaderSize : ModernPacketHeaderSize;
-        if (source.Length < headerSize)
-        {
-            return false;
-        }
-
-        ushort payloadLength = BinaryPrimitives.ReadUInt16LittleEndian(source.Slice(0, sizeof(ushort)));
-        ushort command = BinaryPrimitives.ReadUInt16LittleEndian(source.Slice(2, sizeof(ushort)));
-        if (command > MaxRemotePacketCommand)
-        {
-            return false;
-        }
-
-        int totalLength = headerSize + payloadLength;
-        if (totalLength > source.Length)
-        {
-            return false;
-        }
-
-        int guid = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(4, sizeof(int)));
-        uint id = format == PacketStreamFormat.Modern12
-            ? BinaryPrimitives.ReadUInt32LittleEndian(source.Slice(8, sizeof(uint)))
-            : 0;
-
-        header = new TracePacketHeader(payloadLength, command, guid, id, totalLength);
-        return true;
-    }
-
-    private static PacketStreamFormat DetectPacketStreamFormat(ReadOnlySpan<byte> source)
-    {
-        if (CanParseEntirePacketStream(source, PacketStreamFormat.Legacy8))
-        {
-            return PacketStreamFormat.Legacy8;
-        }
-
-        if (CanParseEntirePacketStream(source, PacketStreamFormat.Modern12))
-        {
-            return PacketStreamFormat.Modern12;
-        }
-
-        return PacketStreamFormat.Unknown;
-    }
-
-    private static bool CanParseEntirePacketStream(ReadOnlySpan<byte> source, PacketStreamFormat format)
-    {
-        int offset = 0;
-        int headerSize = format == PacketStreamFormat.Legacy8 ? LegacyPacketHeaderSize : ModernPacketHeaderSize;
-        if (source.Length < headerSize)
-        {
-            return false;
-        }
-
-        while (offset < source.Length)
-        {
-            if (offset + headerSize > source.Length || !TryReadPacketHeader(source.Slice(offset), format, out TracePacketHeader header))
-            {
-                return false;
-            }
-
-            offset += header.TotalLength;
-        }
-
-        return offset == source.Length;
-    }
-
-    private static string FourCcToString(int guid)
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(int)];
-        BinaryPrimitives.WriteInt32LittleEndian(bytes, guid);
-        return Encoding.ASCII.GetString(bytes);
-    }
-
-    private static byte[] DecompressDatPayload(byte[] compressedData, int decompressedSize)
-    {
-        byte[] decompressed = new byte[decompressedSize];
-        uint actualSize = DatCompression.Decompress(decompressed, compressedData, (uint)compressedData.Length);
-        if (actualSize == 0 || actualSize != decompressedSize)
-        {
-            throw new InvalidOperationException("Failed to decompress CHD bank data.");
-        }
-
-        return decompressed;
-    }
-
-    private static byte[] DecompressFiPayload(byte[] compressedData, int decompressedSize)
-    {
-        byte[] decompressed = new byte[decompressedSize];
-        if (!FiCompression.Decompress(decompressed, (uint)decompressedSize, compressedData))
-        {
-            throw new InvalidOperationException("Failed to decompress CHF bank data.");
-        }
-
-        return decompressed;
-    }
-
-    private readonly record struct TracePacketHeader(int PayloadLength, ushort Command, int Guid, uint Id, int TotalLength);
 }

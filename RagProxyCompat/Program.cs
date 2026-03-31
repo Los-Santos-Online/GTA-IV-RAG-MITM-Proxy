@@ -8,12 +8,6 @@ internal static class Program
         {
             ProxyOptions options = ProxyOptions.Parse(args);
 
-            if (options.RunSelfTest)
-            {
-                SelfTestRunner.Run();
-                return 0;
-            }
-
             using CompatibilityProxy proxy = new(options);
             await proxy.RunAsync();
             return 0;
